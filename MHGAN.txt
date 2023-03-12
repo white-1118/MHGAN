@@ -1,0 +1,303 @@
+import argparse
+import os
+import numpy as np
+import math
+import itertools
+import sys
+import torchvision.transforms as transforms
+from torchvision.utils import save_image, make_grid
+
+from torch.utils.data import DataLoader
+from torch.autograd import Variable
+
+from models import *
+from dataset_input import *
+import pandas as pd
+
+import torch.nn as nn
+import torch.nn.functional as F
+import torch
+
+os.makedirs("images/training", exist_ok=True)
+os.makedirs("saved_models", exist_ok=True)
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--epoch", type=int, default=0, help="epoch to start training from")
+parser.add_argument("--n_epochs", type=int, default=200, help="number of epochs of training")
+parser.add_argument("--GT_path", type=str, default="img_align_celeba", help="path of the GT dataset")
+parser.add_argument("--LR_path", type=str, default="img_align_celeba", help="path of the LR dataset")
+parser.add_argument("--batch_size", type=int, default=4, help="size of the batches")
+parser.add_argument("--lr", type=float, default=0.0002, help="adam: learning rate")
+parser.add_argument("--b1", type=float, default=0.9, help="adam: decay of first order momentum of gradient")
+parser.add_argument("--b2", type=float, default=0.999, help="adam: decay of first order momentum of gradient")
+parser.add_argument("--decay_epoch", type=int, default=100, help="epoch from which to start lr decay")
+parser.add_argument("--n_cpu", type=int, default=8, help="number of cpu threads to use during batch generation")
+parser.add_argument("--hr_height", type=int, default=256, help="high res. image height")
+parser.add_argument("--hr_width", type=int, default=256, help="high res. image width")
+parser.add_argument("--channels", type=int, default=3, help="number of image channels")
+parser.add_argument("--sample_interval", type=int, default=100, help="interval between saving image samples")
+parser.add_argument("--checkpoint_interval", type=int, default=2500, help="batch interval between model checkpoints")
+parser.add_argument("--residual_blocks", type=int, default=23, help="number of residual blocks in the generator")
+parser.add_argument("--warmup_batches", type=int, default=500, help="number of batches with pixel-wise loss only")
+parser.add_argument("--lambda_adv", type=float, default=5e-3, help="adversarial loss weight")
+parser.add_argument("--lambda_pixel", type=float, default=1e-2, help="pixel-wise loss weight")
+parser.add_argument("--lambda_content", type=float, default=1e-2, help="content loss weight")
+parser.add_argument("--num_upsample", type=int, default=2, help="number of *2 upsampling blocks")
+opt = parser.parse_args()
+print(opt)
+
+torch.cuda.set_device(2)
+
+# os.environ["CUDA_VISIBLE_DEVICES"] = "1,2"
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+hr_shape = (opt.hr_height, opt.hr_width)
+
+# Initialize generator and discriminator
+generator = GeneratorRRDB(opt.channels, filters=64, num_res_blocks=opt.residual_blocks,num_upsample=opt.num_upsample).to(device)
+# discriminator = Discriminator(input_shape=(opt.channels, *hr_shape)).to(device)
+discriminator = Discriminator(input_shape=(opt.channels, *hr_shape), num_in_ch = 3).to(device)
+feature_extractor = FeatureExtractor().to(device)
+feature_extractor_1 = FeatureExtractor_1().to(device)
+feature_extractor_2 = FeatureExtractor_2().to(device)
+
+print('# generator parameters:', sum(param.numel() for param in generator.parameters()))  # 输出参数的个数
+
+# Set feature extractor to inference mode
+feature_extractor.eval()
+feature_extractor_1.eval()
+feature_extractor_2.eval()
+
+# Losses
+criterion_GAN = torch.nn.BCEWithLogitsLoss().to(device)
+criterion_content = torch.nn.L1Loss().to(device)
+criterion_pixel = torch.nn.L1Loss().to(device)
+
+if opt.epoch != 0:
+    # Load pretrained models
+    generator.load_state_dict(torch.load("saved_models/generator_%d.pth" % opt.epoch))
+    # discriminator.load_state_dict(torch.load("saved_models/discriminator_%d.pth" % opt.epoch))
+
+# Optimizers
+optimizer_G = torch.optim.Adam(generator.parameters(), lr=opt.lr, betas=(opt.b1, opt.b2))
+optimizer_D = torch.optim.Adam(discriminator.parameters(), lr=opt.lr, betas=(opt.b1, opt.b2))
+
+Tensor = torch.cuda.FloatTensor if torch.cuda.is_available() else torch.Tensor
+
+dataloader = DataLoader(
+    ImageDataset("%s" % opt.GT_path, "%s" % opt.LR_path, hr_shape=hr_shape),
+    batch_size=opt.batch_size,
+    shuffle=True,
+    num_workers=opt.n_cpu,
+)
+
+# ----------
+#  Training
+# ----------
+
+for epoch in range(opt.epoch, opt.n_epochs):
+    for i, imgs in enumerate(dataloader):
+
+        batches_done = epoch * len(dataloader) + i
+
+        # Configure model input
+        imgs_lr = Variable(imgs["lr"].type(Tensor))  # (4,3,64,64)
+        imgs_hr = Variable(imgs["hr"].type(Tensor))  # (4,3,256,256)
+
+        # Adversarial ground truths
+        valid = Variable(Tensor(np.ones((imgs_lr.size(0), *discriminator.output_shape))),
+                         requires_grad=False)  # （4，1，16，16）  *discriminator.output_shape (1,16,16)
+        fake = Variable(Tensor(np.zeros((imgs_lr.size(0), *discriminator.output_shape))),
+                        requires_grad=False)  # （4，1，16，16）
+
+        # ------------------
+        #  Train Generators
+        # ------------------
+
+        optimizer_G.zero_grad()
+
+        # Generate a high resolution image from low resolution input
+        gen_hr = generator(imgs_lr)  # （4，3，64，64）
+        # Measure pixel-wise loss against ground truth
+        loss_pixel = criterion_pixel(gen_hr, imgs_hr)
+
+        if batches_done < opt.warmup_batches:
+            # Warm-up (pixel-wise loss only)
+            loss_pixel.backward()
+            optimizer_G.step()
+            print(
+                "[Epoch %d/%d] [Batch %d/%d] [Learning rate %d] [G pixel: %f]"
+                % (epoch, opt.n_epochs, i, len(dataloader), optimizer_G.state_dict()['param_groups'][0]['lr'],
+                   loss_pixel.item())
+            )
+
+            if batches_done % opt.sample_interval == 0:
+                # Save image grid with upsampled inputs and ESRGAN outputs
+                imgs_lr = nn.functional.interpolate(imgs_lr, scale_factor=4)  ######
+                img_grid = denormalize(torch.cat((imgs_lr, imgs_hr, gen_hr), -1))
+                save_image(img_grid, "images/training/%d.png" % batches_done, nrow=1, normalize=False)
+
+            if batches_done % opt.checkpoint_interval == 0:
+                # Save model checkpoints
+                torch.save(generator.state_dict(), "saved_models/generator_%d.pth" % epoch)
+
+            out_path = 'statistics/'
+
+            Epoch = "%s" % epoch  # 获取当前时间
+            Batch = "Batch[%d]" % i
+            Learning_rate = optimizer_G.state_dict()['param_groups'][0]['lr']
+            Loss_G = "%g" % loss_pixel.item()
+            # 将数据保存在一维列表
+            list = [Epoch, Batch, Learning_rate, Loss_G]
+            # 由于DataFrame是Pandas库中的一种数据结构，它类似excel，是一种二维表，所以需要将list以二维列表的形式转化为DataFrame
+            data = pd.DataFrame([list])
+            data.to_csv(out_path + 'train_results.csv', mode='a', header=False, index=False)  # mode设为a,就可以向csv文件追加数据了
+
+            continue
+
+        # Train generator after warmup batch
+        # Extract validity predictions from discriminator
+        pred_real = discriminator(imgs_hr).detach()  # (4,1,16,16)
+        pred_fake = discriminator(gen_hr)  # (4,1,16,16)
+
+        # Adversarial loss (relativistic average GAN)(之前的版本)
+        loss_GAN = criterion_GAN(pred_fake - pred_real.mean(0, keepdim=True),
+                                 valid)  # 这里始终想不明白  (4,1,16,16) - (1,1,16,16)
+
+        """
+        # Adversarial loss (relativistic average GAN)(BaiscSR 版)
+        loss_g_real = criterion_GAN(pred_real - pred_fake.mean(0, keepdim=True), fake)
+        loss_g_fake = criterion_GAN(pred_fake - pred_real.mean(0, keepdim=True),valid)  # 这里始终想不明白  (4,1,16,16) - (1,1,16,16)
+        loss_GAN = (loss_g_real + loss_g_fake) / 2
+        """
+
+        # Content loss
+        gen_features = feature_extractor(gen_hr)  # (4, 512, 16, 16)
+        real_features = feature_extractor(imgs_hr).detach()  # (4, 512, 16, 16)
+        loss_content = criterion_content(gen_features, real_features)
+
+        """
+        gen_features_1 = feature_extractor_1(gen_hr)  # (4, 512, 16, 16)
+        real_features_1 = feature_extractor_1(imgs_hr).detach()  # (4, 512, 16, 16)
+        loss_content_1 = criterion_content(gen_features_1, real_features_1)
+
+        gen_features_2 = feature_extractor_2(gen_hr)  # (4, 512, 16, 16)
+        real_features_2 = feature_extractor_2(imgs_hr).detach()  # (4, 512, 16, 16)
+        loss_content_2 = criterion_content(gen_features_2, real_features_2)
+
+        loss_content_all = 0.5 * loss_content + 0.3 * loss_content_1 + 0.2 * loss_content_2
+        """
+
+        # Total generator loss   opt.lambda_adv = 0.005   opt.lambda_pixel = 0.01
+        # Change generator loss
+        loss_G = opt.lambda_content * loss_content + opt.lambda_adv * loss_GAN + opt.lambda_pixel * loss_pixel  # loss_content: 1.9017  loss_GAN: 0.7222  loss_pixel =0.4080
+
+        loss_G.backward()
+        optimizer_G.step()
+
+        # ---------------------
+        #  Train Discriminator
+        # ---------------------
+
+        # 之前的版本
+        optimizer_D.zero_grad()
+
+        pred_real = discriminator(imgs_hr)  # (4,1,16,16)
+        pred_fake = discriminator(gen_hr.detach())  # (4,1,16,16)
+
+        # Adversarial loss for real and fake images (relativistic average GAN)
+        loss_real = criterion_GAN(pred_real - pred_fake.mean(0, keepdim=True), valid)
+        loss_fake = criterion_GAN(pred_fake - pred_real.mean(0, keepdim=True), fake)
+
+        # Total loss
+        loss_D = (loss_real + loss_fake) / 2
+
+        loss_D.backward()
+        optimizer_D.step()
+
+        """
+        #########
+        # optimize net_d
+
+        optimizer_d.zero_grad()
+        # real
+        real_d_pred = self.net_d(gan_gt)
+        l_d_real = self.cri_gan(real_d_pred, True, is_disc=True)
+        loss_dict['l_d_real'] = l_d_real
+        loss_dict['out_d_real'] = torch.mean(real_d_pred.detach())
+        l_d_real.backward()
+        # fake
+        fake_d_pred = self.net_d(self.output.detach().clone())  # clone for pt1.9
+        l_d_fake = self.cri_gan(fake_d_pred, False, is_disc=True)
+        loss_dict['l_d_fake'] = l_d_fake
+        loss_dict['out_d_fake'] = torch.mean(fake_d_pred.detach())
+        l_d_fake.backward()
+        self.optimizer_d.step()
+        """
+
+        """
+        # BaiscSR版本
+        optimizer_D.zero_grad()
+        # real
+        pred_real = discriminator(imgs_hr)  # (4,1,16,16)
+        pred_fake = discriminator(gen_hr).detach() # (4,1,16,16)
+
+        # Adversarial loss for real and fake images (relativistic average GAN)
+        loss_real = criterion_GAN(pred_real - pred_fake.mean(0, keepdim=True), valid) * 0.5
+        loss_real.backward()
+
+        pred_fake = discriminator(gen_hr.detach()) # (4,1,16,16)
+        loss_fake = criterion_GAN(pred_fake - pred_real.detach().mean(0, keepdim=True), fake) * 0.5
+        loss_fake.backward()
+        loss_D = loss_real + loss_fake
+        optimizer_D.step()
+        """
+
+        # --------------
+        #  Log Progress
+        # --------------
+
+        print(
+            "[Epoch %d/%d] [Batch %d/%d] [D loss: %f] [G loss: %f, content: %f, adv: %f, pixel: %f]"
+            % (
+                epoch,
+                opt.n_epochs,
+                i,
+                len(dataloader),
+                loss_D.item(),
+                loss_G.item(),
+                loss_content.item(),
+                loss_GAN.item(),
+                loss_pixel.item(),
+            )
+        )
+
+        if batches_done % opt.sample_interval == 0:
+            # Save image grid with upsampled inputs and ESRGAN outputs
+            imgs_lr = nn.functional.interpolate(imgs_lr, scale_factor=4)  #########
+            img_grid = denormalize(torch.cat((imgs_lr, imgs_hr, gen_hr), -1))
+            save_image(img_grid, "images/training/%d.png" % batches_done, nrow=1, normalize=False)
+
+        if batches_done % opt.checkpoint_interval == 0:
+            # Save model checkpoints
+            torch.save(generator.state_dict(), "saved_models/generator_%d.pth" % epoch)
+            torch.save(discriminator.state_dict(), "saved_models/discriminator_%d.pth" % epoch)
+
+        Epoch = "%s" % epoch  # 获取当前时间
+        Batch = "Batch[%d]" % i
+        Learning_rate = optimizer_G.state_dict()['param_groups'][0]['lr']
+        Loss_D = "%g" % loss_D.item()
+        Loss_G = "%g" % loss_G.item()
+        Loss_content = "%g" % loss_content.item()
+        Loss_GAN = "%g" % loss_GAN.item()
+        Loss_pixel = "%g" % loss_pixel.item()
+
+        out_path = 'statistics/'
+        # 将数据保存在一维列表
+        list = [Epoch, Batch, Learning_rate, Loss_D, Loss_G, Loss_content, Loss_GAN, Loss_pixel]
+        # 由于DataFrame是Pandas库中的一种数据结构，它类似excel，是一种二维表，所以需要将list以二维列表的形式转化为DataFrame
+        data = pd.DataFrame([list])
+        data.to_csv(out_path + 'train_results.csv', mode='a', header=False, index=False)  # mode设为a,就可以向csv文件追加数据了
+
+
